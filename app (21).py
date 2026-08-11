@@ -9,7 +9,7 @@ import difflib
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, JobQueue
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from collections import defaultdict, Counter
 from cachetools import TTLCache, LRUCache
 from functools import lru_cache
@@ -24,7 +24,9 @@ BOT_COMMAND_TEXTS = {
     "خصص", "المحفوظ", "المستخدمين", "المحظورين", "عرض الكل", "الإشراف", "إدارة", "اداره", "ادارة", "ايديه",
     "جمم", "ويكي", "مس", "اص", "صج", "شك", "جش", "قص", "نص", "طب", "كرر", "شرط", "فكك", "دبل", "تر", "عكس", "فر", "E", "e", "رق", "حر", "جب", "ريست", "تلقائي",
     "الصدارة", "توب", "أيدي الصدارة", "ايدي الصدارة", "أيدي صدارة الجوال", "ايدي صدارة الجوال", "أيدي صدارة خارجي", "ايدي صدارة خارجي",
-    "باند", "تقييد", "كتم", "الغاء تقييد", "الغاء باند", "فك باند", "طرد", "الغاء كتم"
+    "باند", "تقييد", "كتم", "الغاء تقييد", "الغاء باند", "فك باند", "طرد", "الغاء كتم",
+    "اطلع من هنا", "طرد الكل", "اطرد الكل", "روابط القروبات",
+    "وقف هنا", "شغل هنا", "أيدي الإشراف", "نزل مالك"
 }
 
 message_cache = {}
@@ -818,11 +820,17 @@ class Storage:
         try:
             with open(self.banned_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                print(f"[BANNED] Loaded banned data from {self.banned_file}")
-                return data
+                if isinstance(data, dict):
+                    data.setdefault("banned", [])
+                    data.setdefault("info", {})
+                    return data
+                if isinstance(data, list):
+                    # صيغة قديمة: قائمة أيدي فقط
+                    return {"banned": data, "info": {}}
+                return {"banned": [], "info": {}}
         except (FileNotFoundError, json.JSONDecodeError):
             print("[BANNED] No banned data found, starting fresh")
-            return {"banned": []}
+            return {"banned": [], "info": {}}
 
     def save_banned(self):
         """حفظ المحظورين في ملف منفصل"""
@@ -881,7 +889,9 @@ class Storage:
                 "matchmaking_games": {},
                 "average_speeds": {},
                 "messages_sent": {},
-                "shabah": {}
+                "shabah": {},
+                "chat_members": {},
+                "paused_chats": []
             }
 
     def save(self, force=False):
@@ -929,6 +939,46 @@ class Storage:
             "created_at": datetime.now().isoformat()
         }
         self.mark_dirty()
+
+    def remove_chat(self, cid):
+        if str(cid) in self.data["chats"]:
+            del self.data["chats"][str(cid)]
+            self.mark_dirty()
+            self.save(force=True)
+
+    def record_chat_member(self, cid, uid):
+        """تسجيل عضو شافوه البوت داخل القروب (عشان أمر طرد الكل)"""
+        members = self.data.setdefault("chat_members", {}).setdefault(str(cid), {})
+        uid_str = str(uid)
+        now = time.time()
+        if members.get(uid_str, 0) < now - 60:
+            members[uid_str] = now
+            self.mark_dirty()
+
+    def clear_chat_members(self, cid):
+        if str(cid) in self.data.get("chat_members", {}):
+            del self.data["chat_members"][str(cid)]
+            self.mark_dirty()
+
+    # ===== إيقاف البوت في قروب (أمر وقف هنا) =====
+    def pause_chat(self, cid):
+        key = str(cid)
+        lst = self.data.setdefault("paused_chats", [])
+        if key not in lst:
+            lst.append(key)
+            self.mark_dirty()
+            self.save(force=True)
+
+    def unpause_chat(self, cid):
+        key = str(cid)
+        lst = self.data.get("paused_chats", [])
+        if key in lst:
+            lst.remove(key)
+            self.mark_dirty()
+            self.save(force=True)
+
+    def is_chat_paused(self, cid):
+        return str(cid) in self.data.get("paused_chats", [])
 
     def save_preference(self, uid, section, word_count):
         uid_str = str(uid)
@@ -1039,7 +1089,7 @@ class Storage:
         banned_cache[uid_str] = is_in_list
         return is_in_list
 
-    def ban_user(self, uid):
+    def ban_user(self, uid, reason="حظر يدوي", by_uid=None, by_username=None, by_name=None):
         #  المالك الأساسي محمي من الحظر نهائياً
         if self.is_main_owner(uid):
             print(f"[BAN] Cannot ban primary owner {uid}")
@@ -1048,6 +1098,14 @@ class Storage:
         uid_str = str(uid)
         if uid_str not in self.banned_data["banned"]:
             self.banned_data["banned"].append(uid_str)
+            # حفظ معلومات الحظر: السبب ومن حظر
+            self.banned_data.setdefault("info", {})[uid_str] = {
+                "reason": reason,
+                "by_uid": by_uid,
+                "by_username": by_username,
+                "by_name": by_name,
+                "time": datetime.now().isoformat()
+            }
             self.save_banned()
             print(f"[BAN] User {uid} has been banned. Updated banned list: {self.banned_data['banned']}")
 
@@ -1073,6 +1131,8 @@ class Storage:
 
         if uid_str in self.banned_data["banned"]:
             self.banned_data["banned"].remove(uid_str)
+            # حذف معلومات الحظر
+            self.banned_data.setdefault("info", {}).pop(uid_str, None)
             self.save_banned()
             banned_cache[uid_str] = False
 
@@ -1081,7 +1141,7 @@ class Storage:
 
             self.mark_dirty()
             self.save(force=True)
-            print(f"[UNBAN] User {uid} has been unbanned. Updated banned list: {self.data['banned']}")
+            print(f"[UNBAN] User {uid} has been unbanned. Updated banned list: {self.banned_data['banned']}")
             return True
         else:
             print(f"[UNBAN] User {uid} was not in banned list")
@@ -1331,9 +1391,24 @@ class Storage:
             "random_mode": random_mode,
             "watermarked_text": watermarked_text,
             "last_attempt_time": tm,  # آخر محاولة إجابة
-            "attempts_count": 0  # عدد محاولات الإجابة
+            "attempts_count": 0,  # عدد محاولات الإجابة
+            "wrong_attempts": {}  # محاولات خاطئة لكل مستخدم (لنظام التعديل/التصحيح)
         }
         self.mark_dirty()
+
+    def record_wrong_attempt(self, cid, typ, uid, text):
+        """تسجيل آخر محاولة خاطئة لمستخدم على جلسة (عشان نظام التعديل)"""
+        key = f"{cid}_{typ}"
+        if key in self.data["sessions"]:
+            session = self.data["sessions"][key]
+            if "wrong_attempts" not in session:
+                session["wrong_attempts"] = {}
+            session["wrong_attempts"][str(uid)] = {"text": text, "time": time.time()}
+            self.mark_dirty()
+
+    def save_preference_range(self, uid, section, lo, hi):
+        """حفظ نطاق كلمات (من X الى Y) لقسم"""
+        self.save_preference(uid, f"{section}__range", [lo, hi])
 
     def update_session_attempt(self, cid, typ):
         """تحديث معلومات محاولة الإجابة على جلسة"""
@@ -4037,7 +4112,7 @@ async def check_and_ban_cheater(
         return False
 
     # الحظر التلقائي يتطلب شرطين معاً:
-    # 1. سرعة >= 260
+    # 1. سرعة >= 290
     # 2. دقة = 100% بالضبط
     # يُطبق في كلا الوضعين (تفعيل الدقة وتعطيل الدقة)
     if (wpm >= 290 and 
@@ -4045,8 +4120,8 @@ async def check_and_ban_cheater(
         accuracy is not None and 
         accuracy == 100.0):
         
-        # حظر المستخدم وحذفه من الصدارة تلقائياً
-        storage.ban_user(uid)
+        # حظر المستخدم وحذفه من الصدارة تلقائياً (سبب: تجاوز حد السرعة)
+        storage.ban_user(uid, reason="تجاوز حد السرعة")
 
         # إرسال رسالة الحظر للمستخدم
         await u.message.reply_text("ارسل تصويرك في الخاص @iv511vi ولا راح يستمر الباند او اثبت انك مب نسوخي")
@@ -4649,8 +4724,22 @@ async def cmd_ban(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("لا يمكنك حظر المالك الأساسي")
             return
 
-        storage.ban_user(target_uid)
-        await u.message.reply_text(f"تم حظر المستخدم")
+        # الأدمن ما يقدر يحظر مالك أو أدمن ثاني
+        if not (storage.is_main_owner(uid) or storage.is_owner(uid)):
+            if storage.is_owner(target_uid) or storage.is_admin(target_uid):
+                await u.message.reply_text("ما تقدر تحظر مالك أو مشرف")
+                return
+
+        storage.ban_user(
+            target_uid, reason="حظر يدوي من مشرف",
+            by_uid=uid,
+            by_username=u.effective_user.username,
+            by_name=u.effective_user.first_name
+        )
+        if storage.is_main_owner(uid):
+            await u.message.reply_text("سمعً وطاعة سيدي")
+        else:
+            await u.message.reply_text(f"تم حظر المستخدم")
     else:
         await u.message.reply_text("رد على رسالة المستخدم لحظره")
 
@@ -4672,8 +4761,22 @@ async def cmd_ban_by_id(u: Update, c: ContextTypes.DEFAULT_TYPE, target_uid: int
         await u.message.reply_text("لا يمكنك حظر المالك الأساسي")
         return
 
-    storage.ban_user(target_uid)
-    await u.message.reply_text(f"تم حظر المستخدم")
+    # الأدمن ما يقدر يحظر مالك أو أدمن ثاني
+    if not (storage.is_main_owner(uid) or storage.is_owner(uid)):
+        if storage.is_owner(target_uid) or storage.is_admin(target_uid):
+            await u.message.reply_text("ما تقدر تحظر مالك أو مشرف")
+            return
+
+    storage.ban_user(
+        target_uid, reason="حظر يدوي من مشرف",
+        by_uid=uid,
+        by_username=u.effective_user.username,
+        by_name=u.effective_user.first_name
+    )
+    if storage.is_main_owner(uid):
+        await u.message.reply_text("سمعً وطاعة سيدي")
+    else:
+        await u.message.reply_text(f"تم حظر المستخدم")
 
 async def cmd_unban(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.effective_user or not u.message:
@@ -4895,7 +4998,7 @@ async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     total_users = len(storage.data["users"])
     total_chats = len(storage.data["chats"])
-    banned_count = len(storage.data["banned"])
+    banned_count = len(storage.banned_data["banned"])
 
     stats_details = "\n\nإحصائيات الأقسام:\n"
     types = ["جمم", "ويكي", "مس", "اص", "صج", "شك", "جش", "قص", "نص", "طب", "جب", "كرر", "شرط", "فكك", "دبل", "تر", "عكس", "فر", "E", "رق", "حر"]
@@ -4921,7 +5024,7 @@ async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(msg)
 
 async def cmd_banned_list(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """عرض قائمة المحظورين مع أسماءهم"""
+    """عرض قائمة المحظورين مع أسمائهم وايدياتهم وسبب الحظر"""
     if not u.effective_user or not u.message:
         return
     uid = u.effective_user.id
@@ -4934,7 +5037,7 @@ async def cmd_banned_list(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("هذا الأمر للمالك الأساسي فقط")
         return
 
-    banned_ids = storage.data["banned"]
+    banned_ids = storage.banned_data["banned"]
 
     if not banned_ids:
         await u.message.reply_text("لا يوجد مستخدمين محظورين حالياً")
@@ -4954,7 +5057,31 @@ async def cmd_banned_list(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         msg += f"{idx}. {display} (ID: {uid_str})\n"
 
-    await u.message.reply_text(msg)
+        # معلومات الحظر: السبب ومن حظر
+        info = storage.banned_data.get("info", {}).get(uid_str, {})
+        reason = info.get("reason") or "بدون سبب مسجل"
+        by_uid = info.get("by_uid")
+        by_username = info.get("by_username")
+        by_name = info.get("by_name")
+
+        if reason == "تجاوز حد السرعة":
+            msg += f"   السبب: متجاوز حد السرعة الموضوع في الكود\n"
+        elif by_uid:
+            by_display = by_name or "مشرف"
+            if by_username:
+                by_display = f"{by_display} (@{by_username})"
+            msg += f"   انحظر بواسطة المشرف {by_display} (ID: {by_uid}) — {reason}\n"
+        else:
+            msg += f"   السبب: {reason}\n"
+        msg += "\n"
+
+        # تقسيم الرسالة إذا تجاوزت الحد المسموح
+        if len(msg) > 3500:
+            await u.message.reply_text(msg)
+            msg = ""
+
+    if msg:
+        await u.message.reply_text(msg)
 
 async def cmd_show_all_users(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """عرض جميع المستخدمين الذين لعبوا في البوت"""
@@ -5137,6 +5264,240 @@ async def send_auto_sentence(c: ContextTypes.DEFAULT_TYPE, cid, auto_data):
         display = format_display(sent)
         await c.bot.send_message(chat_id=cid, text=display, message_thread_id=message_thread_id)
 
+async def kick_all_chat_members(bot, cid, skip_ids=None):
+    """يطرد كل الأعضاء المسجلين عند البوت في قروب معين (باند + فك باند = طرد)"""
+    if skip_ids is None:
+        skip_ids = set()
+    skip_ids = set(skip_ids)
+    skip_ids.add(bot.id)
+    skip_ids.add(OWNER_ID)
+
+    # نتخطى ملاك ومشرفين البوت
+    for o in storage.data.get("owners", []):
+        try:
+            skip_ids.add(int(o))
+        except (ValueError, TypeError):
+            pass
+    for a in storage.data.get("admins", []):
+        try:
+            skip_ids.add(int(a))
+        except (ValueError, TypeError):
+            pass
+
+    # مشرفين القروب ما يمدينا نطردهم
+    try:
+        admins = await bot.get_chat_administrators(cid)
+        for adm in admins:
+            skip_ids.add(adm.user.id)
+    except Exception:
+        pass
+
+    members = list(storage.data.get("chat_members", {}).get(str(cid), {}).keys())
+    targets = []
+    for m in members:
+        try:
+            mid = int(m)
+            if mid not in skip_ids:
+                targets.append(mid)
+        except (ValueError, TypeError):
+            continue
+
+    kicked = 0
+    failed = 0
+    sem = asyncio.Semaphore(8)
+
+    async def kick_one(mid):
+        nonlocal kicked, failed
+        async with sem:
+            try:
+                await bot.ban_chat_member(cid, mid)
+                await bot.unban_chat_member(cid, mid)
+                kicked += 1
+            except Exception:
+                failed += 1
+
+    if targets:
+        await asyncio.gather(*(kick_one(mid) for mid in targets))
+    return kicked, failed, len(targets)
+
+async def resolve_group_from_link(bot, link):
+    """يحول رابط قروب (عام أو خاص) إلى chat_id"""
+    link = link.strip()
+    if not link:
+        return None
+    if 't.me/' not in link and not link.startswith('@'):
+        return None
+
+    path = link.split('t.me/')[-1].split('?')[0].rstrip('/').strip()
+
+    # رابط خاص: https://t.me/+abc123
+    if path.startswith('+'):
+        target_hash = path[1:]
+        for cid_str in storage.data.get("chats", {}):
+            try:
+                cid = int(cid_str)
+            except (ValueError, TypeError):
+                continue
+            try:
+                exported = await bot.export_chat_invite_link(cid)
+                exported_hash = exported.rstrip('/').split('/')[-1].lstrip('+')
+                if exported_hash == target_hash:
+                    return cid
+            except Exception:
+                continue
+        return None
+
+    # رابط خاص قديم: https://t.me/joinchat/abc123
+    if path.startswith('joinchat/'):
+        target_hash = path.split('/', 1)[1].lstrip('+')
+        for cid_str in storage.data.get("chats", {}):
+            try:
+                cid = int(cid_str)
+            except (ValueError, TypeError):
+                continue
+            try:
+                exported = await bot.export_chat_invite_link(cid)
+                exported_hash = exported.rstrip('/').split('/')[-1].lstrip('+')
+                if exported_hash == target_hash:
+                    return cid
+            except Exception:
+                continue
+        return None
+
+    # رابط عام: https://t.me/username أو @username
+    username = path.lstrip('@')
+    if not username:
+        return None
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        return chat.id
+    except Exception:
+        return None
+
+# ===== حدود سرعة الصدارة (التوب) =====
+# كل الأقسام حدها 190 ما عدا مس وجب حدهم 210
+# ===== نظام التعديل/التصحيح (يكتب كلمة ناقصة بعد إجابة خاطئة) =====
+# الأقسام اللي يدعمها نظام التعديل (أقسام كلمات عادية)
+CORRECTION_SECTIONS = ["جمم", "ويكي", "مس", "صج", "شك", "جش", "قص", "نص", "طب", "حر", "جب", "فر", "E"]
+
+def clean_correction_text(text):
+    """ينظف رسالة التعديل من أي رموز (مثل *بك) ويخليها كلمة واحدة"""
+    t = text.strip()
+    # إزالة كل الرموز والمسافات والشرطات - يبقى الحروف والأرقام فقط
+    t = re.sub(r'[^\u0600-\u06FFa-zA-Z0-9]+', '', t)
+    return t
+
+def word_overlap_ratio(orig, text):
+    """نسبة الكلمات المشتركة بين الجملة الأصلية ومحاولة المستخدم"""
+    try:
+        o = set(normalize(orig).split())
+        t = set(normalize(text).split())
+    except Exception:
+        return 0.0
+    if not o:
+        return 0.0
+    return len(o & t) / len(o)
+
+def find_missing_words(orig, attempt):
+    """يرجع الكلمات الناقصة في محاولة المستخدم مقارنة بالجملة الأصلية"""
+    if not attempt:
+        return []
+    try:
+        orig_words = normalize(orig).split()
+        attempt_words = normalize(attempt).split()
+    except Exception:
+        return []
+    from collections import Counter
+    oc = Counter(orig_words)
+    ac = Counter(attempt_words)
+    missing = []
+    for w, cnt in oc.items():
+        have = ac.get(w, 0)
+        if have < cnt:
+            missing.extend([w] * (cnt - have))
+    return missing
+
+# ===== نظام نطاق الكلمات (ويكي من 10 الى 20) =====
+# الأقسام اللي تدعم تحديد عدد الكلمات
+RANGE_SECTIONS = ["جمم", "ويكي", "مس", "صج", "شك", "جش", "قص", "نص", "طب", "حر", "جب", "فر", "E", "اص", "عكس"]
+
+def get_random_word_count(uid, section):
+    """يرجع عدد كلمات عشوائي داخل نطاق (من X الى Y) إذا المستخدم سواه"""
+    r = storage.get_preference(uid, f"{section}__range")
+    if isinstance(r, (list, tuple)) and len(r) == 2:
+        try:
+            lo, hi = int(r[0]), int(r[1])
+        except (ValueError, TypeError):
+            return None
+        if 1 <= lo <= hi <= 60:
+            return random.randint(lo, hi)
+    return None
+
+def build_sentence_for_section(uid, section, count):
+    """يبني جملة لعدد كلمات محدد - يدعم جب (أنواعه) وباقي الأقسام"""
+    if section == "جب":
+        jab_type = user_jab_type.get(uid, "قديم")
+        if jab_type == "حرفين":
+            words = JAB_2_LETTERS
+        elif jab_type == "ثلاث":
+            words = JAB_3_LETTERS
+        elif jab_type == "اربع":
+            words = JAB_4_LETTERS
+        elif jab_type == "خمس":
+            words = JAB_5_LETTERS
+        elif jab_type == "مختلط":
+            words = JAB_2_LETTERS + JAB_3_LETTERS + JAB_4_LETTERS + JAB_5_LETTERS
+        else:
+            words = JAB_WORDS
+        return generate_random_sentence(uid, words, count, count, "جب")
+    sent = get_text_with_word_count(managers[section], count)
+    if not sent:
+        sent = managers[section].get()
+    return sent
+
+# ===== إذاعة سريعة وكفؤة (إرسال متوازي مع معالجة Rate Limit) =====
+async def broadcast_send_many(bot, targets, text, pin=False, concurrency=20):
+    """إرسال رسالة لعدد كبير من المستخدمين/القروبات بسرعة:
+    - إرسال متوازي (20 رسالة بنفس الوقت)
+    - معالجة RetryAfter من تلجرام (429) تلقائياً
+    - إرسال على دفعات حتى لا يضغط على الذاكرة
+    - يوصل للكل مهما كان العدد كبير
+    """
+    sent = 0
+    failed = 0
+    sem = asyncio.Semaphore(concurrency)
+
+    async def send_one(target):
+        nonlocal sent, failed
+        async with sem:
+            for attempt in range(3):
+                try:
+                    msg = await bot.send_message(chat_id=target, text=text)
+                    sent += 1
+                    if pin:
+                        try:
+                            await bot.pin_chat_message(chat_id=target, message_id=msg.message_id, disable_notification=True)
+                        except Exception:
+                            pass
+                    return
+                except RetryAfter as e:
+                    # تلجرام طلب ننتظر - ننتظر المدة المحددة ونعيد
+                    wait = getattr(e, "retry_after", 1)
+                    await asyncio.sleep(min(wait, 30))
+                except Exception:
+                    # فشل نهائي (محظور من الخاص أو مشرف في القروب...) نكمل
+                    break
+            failed += 1
+
+    # نرسل على دفعات (50 بالدفعة) - كل دفعة متوازية داخلياً
+    BATCH = 50
+    for i in range(0, len(targets), BATCH):
+        chunk = targets[i:i + BATCH]
+        await asyncio.gather(*(send_one(t) for t in chunk))
+        await asyncio.sleep(0.05)
+
+    return sent, failed
+
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global processed_updates, last_processed_update_cleanup
 
@@ -5159,14 +5520,238 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cid = u.effective_chat.id
     text = u.message.text.strip()
 
+    # إذا القروب موقوف بأمر (وقف هنا) البوت ما يشتغل فيه نهائياً إلا مع المالك الأساسي
+    if u.effective_chat and u.effective_chat.type in ("group", "supergroup") and storage.is_chat_paused(cid) and not storage.is_main_owner(uid):
+        return
+
+    # تسجيل العضو داخل القروب (عشان أمر طرد الكل)
+    if u.effective_chat and u.effective_chat.type in ("group", "supergroup"):
+        storage.record_chat_member(cid, uid)
+
     # فحص الاشتراك فقط عند كتابة أوامر البوت المعروفة، وليس عند أي رسالة عادية
-    if is_bot_command_text(text):
+    # استثناء: أوامر المالك الرئيسي (اطلع من هنا / طرد الكل / روابط القروبات / وقف هنا...) ما تحتاج اشتراك بالقناة
+    owner_commands = ("اطلع من هنا", "طرد الكل", "اطرد الكل", "روابط القروبات", "وقف هنا", "شغل هنا", "نزل مالك")
+    cmd_without_slash = text.strip().lstrip('/').strip()
+    is_owner_cmd = any(cmd_without_slash == x or cmd_without_slash.startswith(x + " ") for x in owner_commands)
+    if is_bot_command_text(text) and not is_owner_cmd:
         if not await require_channel_membership(u, c):
             return
 
     # إزالة "/" من البداية إذا كانت موجودة (لتفعيل الأوامر بدون /)
     if text.startswith('/'):
         text = text[1:]
+
+    # أمر (اطلع من هنا) - يخلي البوت يخرج من المجموعة بشكل كامل
+    if text == "اطلع من هنا":
+        if u.effective_chat.type in ("group", "supergroup"):
+            # الصلاحية: المالك الأساسي فقط
+            if storage.is_main_owner(uid):
+                try:
+                    await u.message.reply_text("سمعً وطاعه يا سيدي")
+                    storage.remove_chat(cid)
+                    await u.effective_chat.leave()
+                except Exception as e:
+                    print(f"[LEAVE] فشل خروج البوت من المجموعة {cid}: {e}")
+                    await u.message.reply_text("ما قدرت اطلع من المجموعة، تأكد ان عندي صلاحية الخروج")
+            else:
+                await u.message.reply_text("ما تقدر تامرني اطلع، هذا الأمر للمالك الرئيسي فقط")
+        else:
+            await u.message.reply_text("هذا الأمر يشتغل فقط داخل المجموعات")
+        return
+
+    # أمر (وقف هنا) - المالك الأساسي يوقف البوت في القروب نهائياً
+    if text == "وقف هنا":
+        if u.effective_chat.type in ("group", "supergroup"):
+            if storage.is_main_owner(uid):
+                storage.pause_chat(cid)
+                await u.message.reply_text("تم، البوت وقف شغله في هذي المجموعة ✋")
+            else:
+                await u.message.reply_text("هذا الأمر للمالك الرئيسي فقط")
+        else:
+            await u.message.reply_text("هذا الأمر يشتغل فقط داخل المجموعات")
+        return
+
+    # أمر (شغل هنا) - المالك الأساسي يرجع البوت يشتغل في القروب
+    if text == "شغل هنا":
+        if u.effective_chat.type in ("group", "supergroup"):
+            if storage.is_main_owner(uid):
+                storage.unpause_chat(cid)
+                await u.message.reply_text("تم، البوت رجع يشتغل في هذي المجموعة ✅")
+            else:
+                await u.message.reply_text("هذا الأمر للمالك الرئيسي فقط")
+        else:
+            await u.message.reply_text("هذا الأمر يشتغل فقط داخل المجموعات")
+        return
+
+    # أمر (أيدي الإشراف) - يعرض ايديات المشرفين مع يوزراتهم
+    if text == "أيدي الإشراف":
+        msg = "أيدي الإشراف:\n\n"
+
+        msg += "المالك الأساسي:\n"
+        owner_data = storage.data["users"].get(str(OWNER_ID), {})
+        owner_username = owner_data.get("username")
+        owner_name = owner_data.get("first_name", "المالك الأساسي")
+        msg += f"- {('@' + owner_username) if owner_username else owner_name} (ID: {OWNER_ID})\n"
+
+        owners = storage.get_all_owners()
+        if owners:
+            msg += "\nالملاك:\n"
+            for owner_id in owners:
+                user_data = storage.data["users"].get(str(owner_id), {})
+                username = user_data.get("username")
+                name = user_data.get("first_name", "مالك")
+                msg += f"- {('@' + username) if username else name} (ID: {owner_id})\n"
+
+        admins = storage.get_all_admins()
+        if admins:
+            msg += "\nالادمنز:\n"
+            for admin_id in admins:
+                user_data = storage.data["users"].get(str(admin_id), {})
+                username = user_data.get("username")
+                name = user_data.get("first_name", "ادمن")
+                msg += f"- {('@' + username) if username else name} (ID: {admin_id})\n"
+
+        if not owners and not admins:
+            msg += "\nلا يوجد ملاك أو ادمنز حالياً.\n"
+
+        await u.message.reply_text(msg)
+        return
+
+    # أمر (طرد الكل / اطرد الكل) - للمالك الرئيسي فقط، يطرد كل أعضاء القروب
+    if text == "طرد الكل" or text == "اطرد الكل" or text.startswith("طرد الكل ") or text.startswith("اطرد الكل "):
+        if not storage.is_main_owner(uid):
+            await u.message.reply_text("هذا الأمر للمالك الرئيسي فقط")
+            return
+
+        target_cid = None
+        link = None
+        if " " in text:
+            link = text.split(" ", 1)[1].strip()
+
+        if link:
+            target_cid = await resolve_group_from_link(c.bot, link)
+            if target_cid is None:
+                await u.message.reply_text("ما لقيت المجموعة من الرابط، تأكد ان البوت موجود فيها واني مشرف بصلاحية سحب الرابط")
+                return
+        else:
+            if u.effective_chat.type not in ("group", "supergroup"):
+                await u.message.reply_text("اكتبه داخل المجموعه او ارفق رابط المجموعه زي كذا:\n(اطرد الكل https://t.me/.....)")
+                return
+            target_cid = cid
+
+        # نتأكد ان البوت مشرف في المجموعة المستهدفة
+        try:
+            me = await c.bot.get_chat_member(target_cid, c.bot.id)
+            if me.status not in ("administrator", "creator"):
+                await u.message.reply_text("تحتاج ترفعني مشرف في المجموعة (مع صلاحية حظر المستخدمين) عشان اقدر اطرد الكل")
+                return
+        except Exception:
+            await u.message.reply_text("ما قدرت اوصل للمجموعة، تأكد ان البوت موجود فيها")
+            return
+
+        await u.message.reply_text("سمعً وطاعة سيدي")
+        kicked, failed, total = await kick_all_chat_members(c.bot, target_cid, skip_ids={uid})
+        storage.clear_chat_members(target_cid)
+
+        if total == 0:
+            await u.message.reply_text("ما فيه اعضاء مسجلين عندي في المجموعة، اللي يرسلون بينسجلون تلقائياً ويمديك تكرر الأمر بعدين")
+            return
+
+        result = f"تم طرد {kicked} عضو من المجموعة 🚪"
+        if failed:
+            result += f"\nفشل طرد {failed} (مشرفين او ما عندي صلاحية عليهم)"
+        await u.message.reply_text(result)
+        return
+
+    # أمر (روابط القروبات) - للمالك الرئيسي فقط، يرسل روابط كل القروبات اللي البوت فيها
+    if text == "روابط القروبات":
+        if not storage.is_main_owner(uid):
+            await u.message.reply_text("هذا الأمر للمالك الرئيسي فقط")
+            return
+
+        chats = storage.data.get("chats", {})
+        if not chats:
+            await u.message.reply_text("ما فيه قروبات مسجله عندي حالياً")
+            return
+
+        await u.message.reply_text("جاري تجميع الروابط...")
+        lines = []
+        for cid_str, info in chats.items():
+            try:
+                chat_id = int(cid_str)
+            except (ValueError, TypeError):
+                continue
+            title = (info or {}).get("title", "بدون اسم")
+            link = None
+            try:
+                chat = await c.bot.get_chat(chat_id)
+                if getattr(chat, "username", None):
+                    link = f"https://t.me/{chat.username}"
+            except Exception:
+                pass
+            if not link:
+                try:
+                    link = await c.bot.export_chat_invite_link(chat_id)
+                except Exception:
+                    pass
+            if not link:
+                try:
+                    link = await c.bot.create_chat_invite_link(chat_id)
+                except Exception:
+                    pass
+            if link:
+                lines.append(f"🏘 {title}\n{link}")
+
+        if not lines:
+            await u.message.reply_text("ما قدرت اجيب الروابط، تأكد اني مشرف في القروبات بصلاحية دعوة المستخدمين")
+            return
+
+        # نرسل الروابط على دفعات حتى لو كانت كثيرة
+        for i in range(0, len(lines), 10):
+            chunk = lines[i:i + 10]
+            msg = "روابط القروبات:\n\n" + "\n\n".join(chunk)
+            await u.message.reply_text(msg)
+        return
+
+    # أمر (نزل مالك [أيدي أو يوزر]) - المالك الأساسي ينزل مالك من الإشراف
+    if (text == "نزل مالك" or text.startswith("نزل مالك ")) and storage.is_main_owner(uid):
+        target_input = text.replace("نزل مالك", "").strip().lstrip('@').strip()
+        if not target_input:
+            await u.message.reply_text("استخدم: نزل مالك [أيدي أو يوزر]\nمثل: نزل مالك @username أو نزل مالك 123456789")
+            return
+
+        target_uid = None
+        if target_input.isdigit():
+            target_uid = int(target_input)
+        else:
+            target_uid = get_user_id_by_username(target_input)
+            if target_uid is None:
+                try:
+                    chat = await c.bot.get_chat(f"@{target_input}")
+                    target_uid = chat.id
+                except Exception:
+                    target_uid = None
+
+        if target_uid is None:
+            await u.message.reply_text("ما حصلت المستخدم. تأكد انه مسجل عندي أو استخدم الأيدي الرقمي.")
+            return
+
+        if target_uid == OWNER_ID:
+            await u.message.reply_text("ما تقدر تنزل نفسك يا المالك الأساسي")
+            return
+
+        if not storage.is_owner(target_uid):
+            await u.message.reply_text(f"❌ `{target_input}` ليس مالك")
+            return
+
+        storage.remove_owner(target_uid)
+        user_data = storage.data["users"].get(str(target_uid), {})
+        username = user_data.get("username")
+        name = user_data.get("first_name", "مستخدم")
+        display = f"@{username}" if username else name
+        await u.message.reply_text(f"✅ تم تنزيل {display} (`{target_uid}`) من الملاك إلى عضو عادي")
+        storage.log_cmd("نزل مالك")
+        return
 
     # رد تلقائي لمن تم تسجيله في خاصية (نشبه) داخل القروبات
     if u.effective_chat and u.effective_chat.type in ("group", "supergroup"):
@@ -5443,6 +6028,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         storage.add_chat(cid, chat_title)
 
     if u.message.reply_to_message and (storage.is_main_owner(uid) or storage.is_owner(uid) or storage.is_admin(uid)):
+        # المحظور ما يقدر يستخدم أوامر الرد الإدارية
+        if storage.is_banned(uid):
+            await u.message.reply_text("انت محظور تواصل مع @iv511vi")
+            return
+
         replied_user = u.message.reply_to_message.from_user
         replied_uid = replied_user.id
         replied_username = replied_user.username
@@ -5452,10 +6042,25 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         if text == "باند":
             if storage.is_main_owner(uid) or storage.is_owner(uid) or storage.is_admin(uid):
-                if not storage.is_main_owner(replied_uid):
-                    storage.ban_user(replied_uid)
-                    await u.message.reply_to_message.reply_text("تم ودن طار يا الامير من البوت")
+                if storage.is_main_owner(replied_uid):
+                    await u.message.reply_text("لا يمكنك حظر المالك الأساسي")
                     return
+                # الأدمن ما يقدر يحظر مالك أو أدمن ثاني
+                if not (storage.is_main_owner(uid) or storage.is_owner(uid)):
+                    if storage.is_owner(replied_uid) or storage.is_admin(replied_uid):
+                        await u.message.reply_text("ما تقدر تحظر مالك أو مشرف")
+                        return
+                storage.ban_user(
+                    replied_uid, reason="حظر يدوي من مشرف",
+                    by_uid=uid,
+                    by_username=u.effective_user.username,
+                    by_name=u.effective_user.first_name
+                )
+                if storage.is_main_owner(uid):
+                    await u.message.reply_to_message.reply_text("سمعً وطاعة سيدي")
+                else:
+                    await u.message.reply_to_message.reply_text("تم ودن طار يا الامير من البوت")
+                return
         elif text in ["الغاء باند", "فك باند"]:
             if storage.is_main_owner(uid) or storage.is_owner(uid) or storage.is_admin(uid):
                 storage.unban_user(replied_uid)
@@ -5529,9 +6134,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
 
         if text in ["تنزيل مالك"] and storage.is_main_owner(uid):
-            # منع المالك الأساسي من تنزيل مالك آخر
-            if storage.is_owner(replied_uid):
-                await u.message.reply_text("اذا بترفع او تنزل تواصل مع @iv511vi")
+            if replied_uid == OWNER_ID:
+                await u.message.reply_text("ما تقدر تنزل نفسك يا المالك الأساسي")
                 return
             
             if storage.is_owner(replied_uid):
@@ -5624,7 +6228,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         storage.log_cmd("تنزيل ادمن")
         return
 
-    # تنزيل مالك [أيدي أو يوزر]
+    # تنزيل مالك [أيدي أو يوزر] - نفس أمر (نزل مالك)
     if text.startswith("تنزيل مالك ") and storage.is_main_owner(uid):
         target_input = text.replace("تنزيل مالك ", "").strip().lstrip('@')
         
@@ -5632,18 +6236,37 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("الرجاء أدخل الأيدي أو اليوزر: `تنزيل مالك 123456789`", parse_mode="Markdown")
             return
         
-        try:
+        target_uid = None
+        if target_input.isdigit():
             target_uid = int(target_input)
-        except ValueError:
-            await u.message.reply_text("الرجاء استخدم الأيدي الرقمي: `تنزيل مالك 123456789`", parse_mode="Markdown")
+        else:
+            target_uid = get_user_id_by_username(target_input)
+            if target_uid is None:
+                try:
+                    chat = await c.bot.get_chat(f"@{target_input}")
+                    target_uid = chat.id
+                except Exception:
+                    target_uid = None
+        
+        if target_uid is None:
+            await u.message.reply_text("ما حصلت المستخدم. تأكد انه مسجل عندي أو استخدم الأيدي الرقمي.")
             return
         
-        # منع تنزيل مالك على مالك
-        if storage.is_owner(target_uid):
-            await u.message.reply_text("اذا بترفع او تنزل تواصل مع @iv511vi")
+        if target_uid == OWNER_ID:
+            await u.message.reply_text("ما تقدر تنزل نفسك يا المالك الأساسي")
             return
         
-        await u.message.reply_text(f"❌ الأيدي `{target_uid}` ليس مالك", parse_mode="Markdown")
+        if not storage.is_owner(target_uid):
+            await u.message.reply_text(f"❌ الأيدي `{target_uid}` ليس مالك", parse_mode="Markdown")
+            storage.log_cmd("تنزيل مالك")
+            return
+        
+        storage.remove_owner(target_uid)
+        user_data = storage.data["users"].get(str(target_uid), {})
+        username = user_data.get("username")
+        name = user_data.get("first_name", "مستخدم")
+        display = f"@{username}" if username else name
+        await u.message.reply_text(f"✅ تم تنزيل {display} (`{target_uid}`) من الملاك إلى عضو عادي")
         storage.log_cmd("تنزيل مالك")
         return
 
@@ -5854,45 +6477,21 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         # رسالة البداية
         await u.message.reply_text("جارٍ إرسال الإذاعة...")
 
-        sent_users = 0
-        failed_users = 0
-        sent_chats = 0
-        failed_chats = 0
+        user_ids = [int(x) for x in storage.data["users"].keys() if str(x).lstrip('-').isdigit()]
+        chat_ids = [int(x) for x in storage.data["chats"].keys() if str(x).lstrip('-').isdigit()]
 
-        # إرسال للمستخدمين
-        for user_id in storage.data["users"].keys():
-            try:
-                sent_broadcast_msg = await c.bot.send_message(chat_id=int(user_id), text=text)
-                sent_users += 1
-                try:
-                    await c.bot.pin_chat_message(chat_id=int(user_id), message_id=sent_broadcast_msg.message_id, disable_notification=True)
-                except:
-                    pass
-            except Exception as e:
-                failed_users += 1
-                print(f"Failed to send to user {user_id}: {e}")
-
-        # إرسال للمجموعات مع التثبيت
-        for chat_id in storage.data["chats"].keys():
-            try:
-                sent_broadcast_msg = await c.bot.send_message(chat_id=int(chat_id), text=text)
-                sent_chats += 1
-                try:
-                    await c.bot.pin_chat_message(chat_id=int(chat_id), message_id=sent_broadcast_msg.message_id, disable_notification=True)
-                except:
-                    pass
-            except Exception as e:
-                failed_chats += 1
-                print(f"Failed to send to chat {chat_id}: {e}")
+        # إرسال متوازي سريع للمستخدمين + المجموعات (مع التثبيت)
+        s_u, f_u = await broadcast_send_many(c.bot, user_ids, text, pin=True)
+        s_c, f_c = await broadcast_send_many(c.bot, chat_ids, text, pin=True)
 
         # الإحصائيات النهائية
         msg = f"تمت الإذاعة:\n\n"
-        msg += f"المستخدمين: {sent_users} نجح"
-        if failed_users > 0:
-            msg += f"، {failed_users} فشل"
-        msg += f"\nالمجموعات: {sent_chats} نجح"
-        if failed_chats > 0:
-            msg += f"، {failed_chats} فشل"
+        msg += f"المستخدمين: {s_u} نجح"
+        if f_u > 0:
+            msg += f"، {f_u} فشل"
+        msg += f"\nالمجموعات: {s_c} نجح"
+        if f_c > 0:
+            msg += f"، {f_c} فشل"
         await u.message.reply_text(msg)
         return
 
@@ -5903,21 +6502,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         # رسالة البداية
         await u.message.reply_text("جارٍ إرسال الإذاعة للمستخدمين...")
 
-        sent_users = 0
-        failed_users = 0
-
-        # إرسال للمستخدمين فقط (في الخاص)
-        for user_id in storage.data["users"].keys():
-            try:
-                sent_broadcast_msg = await c.bot.send_message(chat_id=int(user_id), text=text)
-                sent_users += 1
-                try:
-                    await c.bot.pin_chat_message(chat_id=int(user_id), message_id=sent_broadcast_msg.message_id, disable_notification=True)
-                except:
-                    pass
-            except Exception as e:
-                failed_users += 1
-                print(f"Failed to send to user {user_id}: {e}")
+        user_ids = [int(x) for x in storage.data["users"].keys() if str(x).lstrip('-').isdigit()]
+        sent_users, failed_users = await broadcast_send_many(c.bot, user_ids, text, pin=True)
 
         # الإحصائيات النهائية
         msg = f"تمت إذاعة الخاص:\n\n"
@@ -5934,21 +6520,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         # رسالة البداية
         await u.message.reply_text("جارٍ إرسال الإذاعة للمجموعات...")
 
-        sent_chats = 0
-        failed_chats = 0
-
-        # إرسال للمجموعات فقط
-        for chat_id in storage.data["chats"].keys():
-            try:
-                sent_broadcast_msg = await c.bot.send_message(chat_id=int(chat_id), text=text)
-                sent_chats += 1
-                try:
-                    await c.bot.pin_chat_message(chat_id=int(chat_id), message_id=sent_broadcast_msg.message_id, disable_notification=True)
-                except:
-                    pass
-            except Exception as e:
-                failed_chats += 1
-                print(f"Failed to send to chat {chat_id}: {e}")
+        chat_ids = [int(x) for x in storage.data["chats"].keys() if str(x).lstrip('-').isdigit()]
+        sent_chats, failed_chats = await broadcast_send_many(c.bot, chat_ids, text, pin=True)
 
         # الإحصائيات النهائية
         msg = f"تمت إذاعة القروبات:\n\n"
@@ -5976,7 +6549,12 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 return
             
             # حظر المستخدم
-            storage.ban_user(ban_uid)
+            storage.ban_user(
+                ban_uid, reason="حظر يدوي (باند سريع)",
+                by_uid=uid,
+                by_username=u.effective_user.username,
+                by_name=u.effective_user.first_name
+            )
             await u.message.reply_text("بقي احد؟")
             
         except ValueError:
@@ -6776,7 +7354,6 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            import re
             pattern = r"حذف\s+(@?\S+)\s+من\s+صدارة\s+(الجوال|الخارجي)\s+قسم\s+(\S+)"
             match = re.match(pattern, text)
             
@@ -7817,6 +8394,53 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     active_sessions = storage.get_all_active_sessions(cid)
 
+    # ============ أمر نطاق الكلمات: (ويكي من 10 الى 20) ============
+    # يخلي الجمل تنزل بعدد كلمات عشوائي بين الرقمين - يطبق على جميع الأقسام المدعومة
+    range_match = re.match(r'^(.+?)\s+من\s+(\d+)\s+الى\s+(\d+)\s*$', text)
+    if range_match:
+        sec_name = range_match.group(1).strip()
+        try:
+            rlo = int(range_match.group(2))
+            rhi = int(range_match.group(3))
+        except ValueError:
+            rlo = rhi = 0
+
+        if sec_name in RANGE_SECTIONS and 1 <= rlo <= rhi <= 60:
+            storage.save_preference_range(uid, sec_name, rlo, rhi)
+            # تحديث حالة الصدارة حسب أقل عدد كلمات في النطاق
+            leaderboard_sections = ["كرر", "ويكي", "مس", "شك", "جب", "جش", "جمم"]
+            if sec_name in leaderboard_sections:
+                if rlo >= 10:
+                    storage.enable_section(uid, sec_name)
+                else:
+                    storage.disable_section(uid, sec_name)
+            else:
+                storage.disable_section(uid, sec_name)
+
+            # توليد جملة فورية بعدد عشوائي داخل النطاق
+            rc = random.randint(rlo, rhi)
+            sent = build_sentence_for_section(uid, sec_name, rc)
+            watermarked = None
+            display = format_display(sent)
+            if sec_name == "اص":
+                # قسم اص: الجملة تنحفظ نظيفة والزخرفة للعرض فقط
+                sent = as_strip_to_arabic(sent)
+                if not sent:
+                    sent = managers["اص"].get()
+                watermarked = as_decorate_sentence(sent)
+                display = watermarked
+            storage.del_session(cid, sec_name)
+            storage.save_session(uid, cid, sec_name, sent, time.time(), sent=True, random_mode=False, watermarked_text=watermarked)
+            await u.message.reply_text(f"تم الحين الكلمات راح تكون عشوائية من {rlo} الى {rhi} كلمة في قسم {sec_name}")
+            await asyncio.sleep(0.5)
+            await u.message.reply_text(display)
+            asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, sec_name))
+            storage.log_cmd(f"{sec_name} نطاق")
+            return
+        else:
+            await u.message.reply_text("القسم غير مدعوم أو الأرقام غلط، الصحيح مثل: (ويكي من 10 الى 20)")
+            return
+
     command, word_count = extract_number_from_text(text)
 
     game_commands = ["جمم", "ويكي", "مس", "اص", "صج", "شك", "جش", "قص", "نص", "طب", "فر", "E", "e", "رق", "حر", "جب", "كرر", "شرط", "فكك", "دبل", "تر", "عكس"]
@@ -7862,6 +8486,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text(decorated)
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["اص"], pref_count)
                 sent = as_strip_to_arabic(sent) if sent else None
@@ -7945,6 +8572,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, section))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 if section == "جب":
                     jab_type = user_jab_type.get(uid, "قديم")
@@ -8015,6 +8645,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "فر"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["فر"], pref_count)
                 if not sent:
@@ -8053,6 +8686,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "E"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["E"], pref_count)
                 if not sent:
@@ -8492,6 +9128,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "شرط"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["شرط"], pref_count)
                 if not sent:
@@ -8526,6 +9165,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "فكك"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["فكك"], pref_count)
                 if not sent:
@@ -8556,6 +9198,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "دبل"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["دبل"], pref_count)
                 if not sent:
@@ -8587,6 +9232,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "تر"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["تر"], pref_count)
                 if not sent:
@@ -8618,6 +9266,9 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(trigger_speed_bot_if_enabled(c, cid, sent, "عكس"))
         else:
             pref_count = storage.get_preference(uid, section)
+            range_count = get_random_word_count(uid, section)
+            if range_count is not None:
+                pref_count = range_count
             if pref_count and 1 <= pref_count <= 60:
                 sent = get_text_with_word_count(managers["عكس"], pref_count)
                 if not sent:
@@ -8634,6 +9285,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     best_match = None
     best_elapsed = None
 
+    correction_applied = False  # صار True إذا الجواب كان تصحيح (تعديل)
+
     for session in active_sessions:
         typ = session.get("type")
         orig = session.get("text")
@@ -8645,6 +9298,28 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         matched = False
         accuracy = None
+        via_correction = False
+
+        # ===== نظام التعديل/التصحيح =====
+        # إذا المستخدم كتب كلمة ناقصة (تصحيح) بعد إجابة خاطئة -> تحسب سرعته
+        if not session.get("type", "").startswith("match_") and typ in CORRECTION_SECTIONS:
+            corr = clean_correction_text(text)
+            wrong = session.get("wrong_attempts", {}).get(str(uid))
+            if corr and wrong:
+                missing = find_missing_words(orig, wrong.get("text", ""))
+                if len(missing) == 1 and (corr == missing[0] or corr in missing[0]):
+                    matched = True
+                    via_correction = True
+                    accuracy = 100.0
+                else:
+                    # برضو: لو كتب الجملة كاملة صحيحة مرة ثانية بعد الخطأ -> تعتبر تعديل وتحسب له
+                    try:
+                        if normalize(orig) == normalize(text):
+                            matched = True
+                            via_correction = True
+                            accuracy = 100.0
+                    except Exception:
+                        pass
 
         try:
             user_accuracy_on = is_accuracy_enabled_for(uid)
@@ -8805,13 +9480,29 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             print(f"Error matching session: {e}")
             continue
 
+        # إذا كان تصحيح: نرجع القيم الصحيحة لأن فحص المطابقة العادي ما يناسب رسالة التصحيح
+        if via_correction:
+            matched = True
+            accuracy = 100.0
+
+        # إذا الإجابة ما طابقت: سجلها كمحاولة خاطئة (عشان يقدر يعدلها بعدين)
+        if not matched:
+            if not via_correction and not session.get("type", "").startswith("match_") and typ in CORRECTION_SECTIONS:
+                if word_overlap_ratio(orig, text) >= 0.5:
+                    storage.record_wrong_attempt(cid, typ, uid, text)
+
         if matched:
-            if best_match is None or elapsed < best_elapsed:
+            if via_correction:
+                # التعديل مربوط بهذي الجلسة بالذات - خذها فوراً
+                best_match = session
+                best_elapsed = elapsed
+                correction_applied = True
+            elif best_match is None or elapsed < best_elapsed:
                 best_match = session
                 best_elapsed = elapsed
 
         # فحص 1v1 matchmaking - اختر أقرب جلسة match بغض النظر عما إذا كانت مطابقة
-        if session.get("type", "").startswith("match_"):
+        if not correction_applied and session.get("type", "").startswith("match_"):
             if best_match is None or (best_match.get("type", "").startswith("match_") and elapsed < best_elapsed):
                 best_match = session
                 best_elapsed = elapsed
@@ -8853,6 +9544,10 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 accuracy = compute_accuracy(orig, text, "arabic") if user_accuracy_enabled else compute_word_based_accuracy(orig, text, "arabic")
         except Exception:
             accuracy = compute_accuracy(orig, text, "arabic")
+
+        # إذا كان الجواب تصحيح (تعديل): الدقة 100% لأن الكلمة الناقصة انكتبت صح
+        if correction_applied:
+            accuracy = 100.0
 
         # التحقق من 1v1 matchmaking
         if typ.startswith("match_"):
@@ -9178,7 +9873,11 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 all_words_present_flag = is_all_words_present(orig, text, "arabic")
         except Exception:
             all_words_present_flag = False
-        
+
+        # إذا كان التصحيح (تعديل) -> كل الكلمات موجودة لأن الناقص انكتب صح
+        if correction_applied:
+            all_words_present_flag = True
+
         # المنطق:
         # - في الجولات: قبول 100% فقط، تجاهل ما دون ذلك بدون إرسال رسالة
         # - عند تفعيل الدقة (خارج الجولات): قبول فقط إذا دقة >= 80%
@@ -9193,14 +9892,16 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             # خارج الجولات مع تعطيل الدقة - قبول فقط إذا كانت جميع الكلمات موجودة (أي ترتيب/تكرار)
             is_fully_accepted = all_words_present_flag
 
+        # إذا الإجابة ما قبلت نهائياً: سجلها كمحاولة خاطئة للمستخدم
+        if not is_fully_accepted and not correction_applied:
+            storage.record_wrong_attempt(cid, typ, uid, text)
+
         # إذا كانت الإجابة مقبولة (إرسال السرعة)، حفظ الصدارة
         if is_fully_accepted:
             # للأقسام الستة المرئية في الصدارة: احفظ دائماً إذا كانت الإجابة مقبولة
-            # و الدقة >= 100% (أي مقبولة بالكامل)
             # استثناء: جب حرفين لا يحسب في الصدارة
             leaderboard_sections = ["كرر", "ويكي", "مس", "شك", "جب", "جش", "جمم"]
             if score_typ in leaderboard_sections:
-                # للأقسام الستة: احفظ عندما تكون الإجابة مقبولة (all_words_present أو accuracy >= 80%)
                 # التحقق من أن جب حرفين لا يدخل الصدارة
                 if score_typ == "جب" and user_jab_type.get(uid) == "حرفين":
                     pass  # لا تحفظ جب حرفين في الصدارة
@@ -9232,6 +9933,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 reply = f"كفو يا {mention}\n\nسرعتك: {wpm:.2f} كلمة/دقيقة\nالوقت : {elapsed:.2f} ثانية"
                 if accuracy is not None and user_accuracy_enabled:
                     reply += f"\nالدقة : {accuracy}%"
+                if correction_applied:
+                    reply = "بعد التعديل ✅\n\n" + reply
                 await u.message.reply_text(reply)
                 storage.del_session(cid, typ)
                 storage.save()
@@ -9266,6 +9969,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         if accuracy is not None and user_accuracy_enabled:
                                reply += f"الدقة : {accuracy}%\n"
                         reply += f"\n{round_stats}"
+                        if correction_applied:
+                            reply = "بعد التعديل ✅\n\n" + reply
                         await u.message.reply_text(reply)
 
                         # التحقق: هل الجولة بالفعل انتهت (أحدهم وصل للهدف بالفعل)؟
@@ -9286,6 +9991,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         if accuracy is not None and user_accuracy_enabled:
                                reply += f"الدقة : {accuracy}%\n"
                         reply += f"التقدم: {wins}/{target}\n{round_stats}"
+                        if correction_applied:
+                            reply = "بعد التعديل ✅\n\n" + reply
                         await u.message.reply_text(reply)
                         # حذف الجلسة فقط إذا كانت مقبولة تماماً
                         storage.del_session(cid, typ)
@@ -9306,6 +10013,8 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 reply = f"كفو يا {mention}\n\nسرعتك: {wpm:.2f} كلمة/دقيقة\nالوقت : {elapsed:.2f} ثانية"
                 if accuracy is not None and user_accuracy_enabled:
                     reply += f"\nالدقة : {accuracy}%"
+                if correction_applied:
+                    reply = "بعد التعديل ✅\n\n" + reply
                 await u.message.reply_text(reply)
             else:
                 # الإجابة غير مقبولة - لا ترسل شي، فقط اتركها معلقة للمحاولة مرة أخرى
